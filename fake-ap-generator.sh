@@ -127,12 +127,33 @@ export NCURSES_NO_UTF8_ACS=1
 if [[ ! -d "$SSID_DIR" ]]; then mkdir -p "$SSID_DIR"; fi
 if [[ ! "$(ls -A "$SSID_DIR" 2>/dev/null)" ]]; then
     cat << EOF > "$DUMMY_FILE"
-A0:B1:C2:D3:E4:F5 Test Network
-B1:C2:D3:E4:F5:A0 Fake_AP_123
-C2:D3:E4:F5:A0:B1 Guest WiFi
-D3:E4:F5:A0:B1:C2 Free Public Internet
-E4:F5:A0:B1:C2:D3 Long SSID Name That Exceeds Normal Lengths
-019283746510 Short MAC Example
+02:11:22:33:44:01  No More Mr. Wi-Fi
+02:11:22:33:44:02  Wi Believe I Can Fi
+02:11:22:33:44:03  No Wi-Fi for You!
+02:11:22:33:44:05  Friendly Neighborhood Spider-Lan
+02:11:22:33:44:06  Router? I Hardly Know Her!
+02:11:22:33:44:07  Look Ma, No Wires
+02:11:22:33:44:08  Keep It on The Download
+02:11:22:33:44:09  Winter WonderLAN
+02:11:22:33:44:0A  The LAN of the Free
+02:11:22:33:44:0C  IP Frequently
+02:11:22:33:44:0D  No Laughing Router
+02:11:22:33:44:0E  Wi Oh Wi
+02:11:22:33:44:10  Feeling Routy
+02:11:22:33:44:11  Caught in the Interweb
+02:11:22:33:44:12  Wi-Finders Keepers
+02:11:22:33:44:13  Putting in the Network
+02:11:22:33:44:14  My Wi-Fi Is Always Right
+02:11:22:33:44:15  Wi-Find You Cute
+02:11:22:33:44:16  Feed Me
+02:11:22:33:44:17  Leaky Sync
+02:11:22:33:44:18  Smooth as Buffer
+02:11:22:33:44:19  Just One Byte
+02:11:22:33:44:1A  The Web of Lies
+02:11:22:33:44:1B  That’s One Hotspot
+02:11:22:33:44:1C  Ask Me Out on a Data
+02:11:22:33:44:1D  Tear Down This Firewall
+02:11:22:33:44:1E  Can You See Where IP?
 EOF
 fi
 
