@@ -1,25 +1,43 @@
 #!/bin/bash
 
 # ==============================================================================
-# Debug setting: Set DEBUG=1 to enable logging to fake_ap_debug.log
+# Global Variables and Configuration
 # ==============================================================================
 DEBUG=0
 DEBUG_LOG="fake_ap_debug.log"
+PROGNAME=${0##*/}
+LOCKFILE="/var/run/${PROGNAME%%.*}.pid"
+BACKTITLE="Fake Access Point SSID Generator"
+SSID_DIR="./ssid_lists"
+DUMMY_FILE="$SSID_DIR/dummy-list.txt"
+CLEANED_UP=false
+STEP=1
+LAST_ITEM_IFACE="ALL"
+LAST_ITEM_SSID="ALL"
+COMBINED_SSID_FILE=""
+
+# Arrays and Associative Arrays
+declare -A IFACE_MANAGED_STATE
+declare -A SELECTED_SSIDS
+declare -A SELECTED_INTERFACES
+declare -A TOUCHED_INTERFACES
+declare -a MDK_PIDS
+declare -A IFACE_IP
+declare -A IFACE_INTERNET
+
+# Temporary files
+DIALOGRC=$(mktemp /tmp/fake_ap_dialogrc.XXXXXX)
+CHOICE_FILE=$(mktemp /tmp/fake_ap_choice.XXXXXX)
+
+# ==============================================================================
+# Function Definitions
+# ==============================================================================
 
 log_debug() {
     if [[ "$DEBUG" == "1" ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DEBUG_LOG"
     fi
 }
-
-# Root check
-if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root (use sudo)."
-   exit 1
-fi
-
-# Dependency check
-log_debug "Starting script. System check."
 
 check_dep() {
     local cmd=$1
@@ -35,35 +53,23 @@ check_dep() {
     fi
 }
 
-check_dep "airmon-ng" "aircrack-ng"
-check_dep "mdk4" "mdk4"
-check_dep "dialog" "dialog"
-check_dep "nmcli" "network-manager"
-check_dep "iw" "iw"
-
-# Global variables and temp files
-DIALOGRC=$(mktemp /tmp/fake_ap_dialogrc.XXXXXX)
-CHOICE_FILE=$(mktemp /tmp/fake_ap_choice.XXXXXX)
-BACKTITLE="Fake Access Point SSID Generator"
-SSID_DIR="./ssid_lists"
-DUMMY_FILE="$SSID_DIR/dummy-list.txt"
-declare -A IFACE_MANAGED_STATE
-declare -A SELECTED_SSIDS
-declare -A SELECTED_INTERFACES
-declare -A TOUCHED_INTERFACES
-declare -a MDK_PIDS
-COMBINED_SSID_FILE=""
-CLEANED_UP=false
-
-# Cleanup function
 cleanup() {
     if [[ "$CLEANED_UP" == "true" ]]; then return; fi
     CLEANED_UP=true
+
+    # Lockfile cleanup
+    if [ -e "${LOCKFILE:-/missing}" ]; then
+        LOCKPID=$(cat "${LOCKFILE:-/missing}" 2>/dev/null)
+        if [ "$$" -eq "${LOCKPID:-empty}" ]; then
+            rm -f "${LOCKFILE:-/missing}"
+        fi
+    fi
+
     clear
     echo -e "\n[+] Cleaning up..."
     log_debug "Cleanup initiated"
     for pid in "${MDK_PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
+        if kill -0 "$pid" 2>/dev/null; then 
             log_debug "Killing mdk4 process $pid"
             kill "$pid" 2>/dev/null
         fi
@@ -89,13 +95,61 @@ cleanup() {
     exit 0
 }
 
-trap cleanup SIGINT SIGTERM EXIT
-
 set_color() {
     local key=$1
     local value=$2
     if grep -q "^$key =" "$DIALOGRC" 2>/dev/null; then sed -i "s/^$key =.*/$key = $value/" "$DIALOGRC"; fi
 }
+
+get_interfaces() { iw dev 2>/dev/null | grep Interface | awk '{print $2}' | grep -v -E "eth0|wwan|lo"; }
+
+get_interface_info() {
+    local iface=$1
+    local ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+    local internet="NO"
+    if [[ -n "$ip_addr" ]]; then if ping -c 1 -W 1 -I "$iface" 8.8.8.8 >/dev/null 2>&1; then internet="YES"; fi; fi
+    echo "${ip_addr:-None}|$internet"
+}
+
+# ==============================================================================
+# Initial Setup and Checks
+# ==============================================================================
+
+trap cleanup SIGINT SIGTERM EXIT
+
+# Root check
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root (use sudo)."
+   exit 1
+fi
+
+# Check for already running script
+if [ -e "${LOCKFILE}" ]; then
+    # There is a lockfile
+    OLD_PROCESS_PID="$(cat "${LOCKFILE}")"
+    PROCESS_FOUND="$(ps -p "${OLD_PROCESS_PID}" -o pid 2>/dev/null | grep -cv PID)"
+    # Check if old process is running
+    if [ "${PROCESS_FOUND}" -ne 0 ]; then
+        # The PID found in the lockfile is running
+        echo "### ERROR - Lockfile ${LOCKFILE} exist."
+        echo "            This script is already running with PID: ${OLD_PROCESS_PID}"
+        echo ""
+        exit 3
+    else
+        # The PID found in the lockfile is NOT running - remove the lock file
+        rm -f "${LOCKFILE}"
+        echo -e "### WARNING ###\tOld lockfile found but process was not running - writing new lockfile"
+    fi
+fi
+echo $$ > "${LOCKFILE}"
+
+# Dependency check
+log_debug "Starting script. System check."
+check_dep "airmon-ng" "aircrack-ng"
+check_dep "mdk4" "mdk4"
+check_dep "dialog" "dialog"
+check_dep "nmcli" "network-manager"
+check_dep "iw" "iw"
 
 # Initialize Dialog configuration
 dialog --create-rc "$DIALOGRC" >/dev/null 2>&1
@@ -116,74 +170,93 @@ set_color "button_key_active_color" "(WHITE,RED,ON)"
 set_color "button_key_inactive_color" "(BLACK,WHITE,OFF)"
 set_color "button_label_active_color" "(WHITE,RED,ON)"
 set_color "button_label_inactive_color" "(BLACK,WHITE,OFF)"
-# Disable hotkey highlights by setting keys to empty
 set_color "act_button_left_key" '""'
 set_color "act_button_right_key" '""'
+
 
 export DIALOGRC
 export ESCDELAY=0
 export NCURSES_NO_UTF8_ACS=1
 
 if [[ ! -d "$SSID_DIR" ]]; then mkdir -p "$SSID_DIR"; fi
-if [[ ! "$(ls -A "$SSID_DIR" 2>/dev/null)" ]]; then
+if [[ ! -f "$DUMMY_FILE" ]]; then
     cat << EOF > "$DUMMY_FILE"
-02:11:22:33:44:01  No More Mr. Wi-Fi
-02:11:22:33:44:02  Wi Believe I Can Fi
-02:11:22:33:44:03  No Wi-Fi for You!
-02:11:22:33:44:05  Friendly Neighborhood Spider-Lan
-02:11:22:33:44:06  Router? I Hardly Know Her!
-02:11:22:33:44:07  Look Ma, No Wires
-02:11:22:33:44:08  Keep It on The Download
-02:11:22:33:44:09  Winter WonderLAN
-02:11:22:33:44:0A  The LAN of the Free
-02:11:22:33:44:0C  IP Frequently
-02:11:22:33:44:0D  No Laughing Router
-02:11:22:33:44:0E  Wi Oh Wi
-02:11:22:33:44:10  Feeling Routy
-02:11:22:33:44:11  Caught in the Interweb
-02:11:22:33:44:12  Wi-Finders Keepers
-02:11:22:33:44:13  Putting in the Network
-02:11:22:33:44:14  My Wi-Fi Is Always Right
-02:11:22:33:44:15  Wi-Find You Cute
-02:11:22:33:44:16  Feed Me
-02:11:22:33:44:17  Leaky Sync
-02:11:22:33:44:18  Smooth as Buffer
-02:11:22:33:44:19  Just One Byte
-02:11:22:33:44:1A  The Web of Lies
-02:11:22:33:44:1B  That’s One Hotspot
-02:11:22:33:44:1C  Ask Me Out on a Data
-02:11:22:33:44:1D  Tear Down This Firewall
-02:11:22:33:44:1E  Can You See Where IP?
+00:1B:54:0C:D2:E5 Smooth as Buffer
+00:1B:54:18:CA:47 The promised LAN
+00:1B:54:21:7F:3A My Wi-Fi Is Always Right
+00:1B:54:3F:11:6C Router? I Hardly Know Her!
+00:1B:54:4D:16:2A The LAN of Lost Souls
+00:1B:54:54:9E:01 Nacho WiFi
+00:1B:54:6B:8C:12 Feeling Routy
+00:1B:54:6E:22:B4 I Can Haz WiFi?
+00:1B:54:88:12:DA Ask Me Out on a Data
+00:1B:54:97:0A:7D The Upside Down-load
+00:1B:54:9D:40:57 The LAN of the Free
+00:25:9C:91:FE:14 404 Network Unavailable
+18:56:80:D2:7C:A8 Dunder Mifflin
+1C:B7:2C:90:5E:D1 Lord of the Pings
+2C:30:33:03:7F:29 It Hurts when IP
+2C:30:33:1A:55:9F Wi Oh Wi
+2C:30:33:2D:4A:BC Tell my WiFi I love her
+2C:30:33:4C:9A:2E Winter WonderLAN
+2C:30:33:5F:C7:41 That’s One Hotspot
+2C:30:33:6B:D0:11 Hotspot Time Machine
+2C:30:33:7E:11:93 Gateway to Heaven
+2C:30:33:8B:6E:10 Friendly Neighborhood Spider-Lan
+2C:30:33:90:3C:DA Hidden Network
+2C:30:33:AF:18:07 Leaky Sync
+2C:30:33:CC:38:55 Bat Cave Guest Network
+2C:30:33:DE:03:68 Putting in the Network
+2C:F0:5D:6B:4A:CE Free Public WiFi
+34:60:F9:CB:05:8E Click Here for Viruses
+3C:84:6A:91:2F:B0 Bill Wi the Science Fi
+40:ED:98:61:0A:BC Who What When Where WiFi
+50:C7:BF:0A:9E:74 Wi-Finders Keepers
+50:C7:BF:10:77:3B Keep It on The Download
+50:C7:BF:12:5A:E1 WiFi so Serious?
+50:C7:BF:2F:88:1B WiFi-ve More Minutes
+50:C7:BF:33:61:99 Feed Me
+50:C7:BF:3A:19:4F The Cake is a Lie
+50:C7:BF:5D:02:AF No Wi-Fi for You!
+50:C7:BF:71:0F:2C The Web of Lies
+50:C7:BF:8E:34:C2 No Laughing Router
+50:C7:BF:9C:2B:5E Burrito Management System
+50:C7:BF:CE:90:08 Can You See Where IP?
+50:C7:BF:FA:10:60 Don’t Stop Believ-LAN
+58:EF:68:2A:9C:41 Silence of the LANs
+5C:A6:E6:4E:88:21 Winternet is Coming
+64:16:7F:AD:92:38 Blast Off Modem
+6C:72:20:AF:09:31 I Believe Wi Can Fi
+70:4F:57:8B:33:AD Hogwarts Great Hall Wi-Fi
+84:D6:D0:7A:3C:59 Trojan Virus
+90:9F:33:81:B4:F2 Abraham Linksys
+9C:53:22:AF:44:08 Routers of the Lost Ark
+A4:2B:8C:77:10:3E Wu-Tang LAN
+A8:5B:F3:2E:19:77 Accio Internet
+AC:15:A2:3D:7F:66 You’re a Wi-Fi, Harry
+B8:27:EB:9C:11:73 New England Clam Router
+C0:25:E9:3A:66:4D Bandwidth Together
+D8:5D:4C:6F:01:92 Yoda Only Connection I Need
+DC:A6:32:58:EF:04 Inigo the Modem
+E0:3F:49:12:C8:6A Return of the Wi-Fi
+EC:9B:F3:44:21:0A Every day I’m buffering
+F0:9F:C2:0F:73:26 Not a Secret Government base
+F0:9F:C2:13:6D:9C Tear Down This Firewall
+F0:9F:C2:24:6E:92 The Banana Stand
+F0:9F:C2:2B:FE:01 IP Frequently
+F0:9F:C2:35:DB:79 Hello, is it me your’e looking 4
+F0:9F:C2:4E:20:5B Wi-Find You Cute
+F0:9F:C2:6A:05:F0 Drop it like it’s Hotspot
+F0:9F:C2:7C:31:A8 Caught in the Interweb
+F0:9F:C2:81:94:0C Pretty Fly for a WiFi
+F0:9F:C2:9A:44:30 Just One Byte
 EOF
 fi
 
-# Banner
-BANNER='                       __..--"".          .""--..__
-                 _..-``       ][\        /[]       ``-.._
-             _.-`           __/\ \      / /\__           `-._
-          .-`     __..---```    \ \    / /    ```---..__     `-.
-        .`  _.--``               \ \  / /               ``--._  `.
-       / .-`                      \ \/ /                      `-. \
-      /.`                          \/ /                          `.\
-     |`                            / /\                            `|
-
-  FAKE ACCESSPOINT SSID GENERATOR - FLOOD THE AIR WITH FALSE WIFI NAMES'
-
 clear
-echo "$BANNER"
 
-get_interfaces() { iw dev 2>/dev/null | grep Interface | awk '{print $2}' | grep -v -E "eth0|wwan|lo"; }
-get_interface_info() {
-    local iface=$1
-    local ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-    local internet="NO"
-    if [[ -n "$ip_addr" ]]; then if ping -c 1 -W 1 -I "$iface" 8.8.8.8 >/dev/null 2>&1; then internet="YES"; fi; fi
-    echo "${ip_addr:-None}|$internet"
-}
-
+# Initialize Interface Data
 INTERFACES=($(get_interfaces))
-declare -A IFACE_IP
-declare -A IFACE_INTERNET
 for iface in "${INTERFACES[@]}"; do
     info=$(get_interface_info "$iface")
     IFACE_IP[$iface]=${info%|*}
@@ -218,10 +291,9 @@ if [[ ${#INTERFACES[@]} -eq 1 ]]; then
     SELECTED_INTERFACES[${INTERFACES[0]}]="on"
 fi
 
-# State Machine
-STEP=1
-LAST_ITEM_IFACE="ALL"
-LAST_ITEM_SSID="ALL"
+# ==============================================================================
+# Main Menu Loop (State Machine)
+# ==============================================================================
 
 while true; do
     COLS=$(tput cols 2>/dev/null || echo 80)
@@ -242,25 +314,22 @@ while true; do
                 status_str=$(printf "%-4s  IP: %-15s  Internet: %b" "$mark" "${IFACE_IP[$iface]}" "$inet_display")
                 options+=("$iface" "$status_str")
             done
-
+            
             DEFAULT_BTN="extra" # Toggle
-            if [[ "$AUTO_SELECTED_IFACES" == "true" || ${#INTERFACES[@]} -eq 1 ]]; then
+            if [[ ${#INTERFACES[@]} -eq 1 ]] || [[ $NO_INTERNET_COUNT -gt 0 ]]; then
                 DEFAULT_BTN="cancel" # Next
             fi
 
             X_OFFSET=$(( (COLS - 80) / 2 )); [[ $X_OFFSET -lt 0 ]] && X_OFFSET=0
             Y_OFFSET=$(( (LINES - 20) / 2 )); [[ $Y_OFFSET -lt 0 ]] && Y_OFFSET=0
 
-            # Buttons: [Exit] [Toggle] [Next]
-            # OK=Exit(0), Extra=Toggle(3), Cancel=Next(1)
-            # Note: --bind-key removed for compatibility with older dialog versions
             dialog --colors --backtitle "$BACKTITLE" \
                 --begin $Y_OFFSET $X_OFFSET --title " Interface Selection " \
                 --ok-label "Exit" --extra-button --extra-label "Toggle" \
                 --cancel-label "Next" \
-                --default-button extra --default-item "$LAST_ITEM_IFACE" \
+                --default-button $DEFAULT_BTN --default-item "$LAST_ITEM_IFACE" \
                 --menu "Select wireless interfaces to use for Fake APs:" 20 80 12 "${options[@]}" 2>"$CHOICE_FILE"
-
+            
             status=$?
             choice=$(cat "$CHOICE_FILE")
             log_debug "Step 1: status=$status choice='$choice'"
@@ -271,16 +340,14 @@ while true; do
                     [[ "$choice" == " " ]] && continue
                     count=0
                     for iface in "${INTERFACES[@]}"; do [[ "${SELECTED_INTERFACES[$iface]}" == "on" ]] && ((count++)); done
-
-                    # If nothing selected, try to select focused item
+                    
                     if [[ $count -eq 0 && -n "$choice" && "$choice" != "ALL" ]]; then
                         SELECTED_INTERFACES["$choice"]="on"
                         count=1
                         log_debug "Auto-selected focused interface: $choice"
                     fi
 
-                    if [[ $count -gt 0 ]]; then
-                        # Check for internet warning
+                    if [[ $count -gt 0 ]]; then 
                         has_internet=false
                         for iface in "${INTERFACES[@]}"; do
                             if [[ "${SELECTED_INTERFACES[$iface]}" == "on" && "${IFACE_INTERNET[$iface]}" == "YES" ]]; then has_internet=true; break; fi
@@ -291,7 +358,7 @@ while true; do
                         fi
                         STEP=2
                         log_debug "Proceeding to Step 2"
-                    else
+                    else 
                         dialog --colors --title " Error " --msgbox "Please select at least one interface!" 6 40
                     fi
                     ;;
@@ -321,7 +388,7 @@ while true; do
                     log_debug "Auto-selected first SSID file: $(basename "${ssid_list[0]}")"
                  fi
             fi
-
+            
             all_ssids_on=true
             for f in "${ssid_list[@]}"; do [[ "${SELECTED_SSIDS[$(basename "$f")]}" == "off" ]] && all_ssids_on=false && break; done
             mark="[ ]"; $all_ssids_on && mark="[X]"
@@ -334,55 +401,51 @@ while true; do
                 options+=("$bn" "$mark Lines: $lc")
             done
 
-            if [[ "$LAST_ITEM_SSID" == "ALL" && ${#ssid_list[@]} -gt 0 ]]; then
+            if [[ "$LAST_ITEM_SSID" == "ALL" && ${#ssid_list[@]} -gt 0 ]]; then 
                 PREVIEW_FILE=$(basename "${ssid_list[0]}")
-            else
+            else 
                 PREVIEW_FILE="$LAST_ITEM_SSID"
             fi
-
+            
             if [[ -n "$PREVIEW_FILE" && -f "$SSID_DIR/$PREVIEW_FILE" ]]; then
-                # Strip MAC from preview
                 PREVIEW_TEXT=$(head -n 5 "$SSID_DIR/$PREVIEW_FILE" 2>/dev/null | sed -E 's/^([0-9A-Fa-f:]{12,17}|[0-9A-Fa-f]{12}) //' | while read -r line; do printf "%s\\n" "$line"; done)
-            else
+            else 
                 PREVIEW_TEXT="No preview available."
             fi
-
+            
             X_OFFSET=$(( (COLS - 80) / 2 )); [[ $X_OFFSET -lt 0 ]] && X_OFFSET=0
             Y_OFFSET=$(( (LINES - 21) / 2 )); [[ $Y_OFFSET -lt 0 ]] && Y_OFFSET=0
 
-            # Buttons: [Exit] [Toggle] [Next]
-            # OK=Exit(0), Extra=Toggle(3), Cancel=Next(1)
-            # Note: --bind-key removed for compatibility with older dialog versions
             dialog --colors --backtitle "$BACKTITLE" \
                 --begin $((Y_OFFSET + 13)) $X_OFFSET --title " Preview (First 5 SSIDs) " --infobox "$PREVIEW_TEXT" 8 80 \
                 --and-widget \
                 --begin $Y_OFFSET $X_OFFSET --title " SSID Category Selection " \
-                --ok-label "Exit" --extra-button --extra-label "Toggle" \
+                --ok-label "Back" --extra-button --extra-label "Toggle" \
                 --cancel-label "Next" \
-                --default-button extra --default-item "$LAST_ITEM_SSID" \
+                --default-button cancel --default-item "$LAST_ITEM_SSID" \
                 --menu "Choose SSID lists:" 12 80 4 "${options[@]}" 2>"$CHOICE_FILE"
-
+            
             status=$?
             choice=$(cat "$CHOICE_FILE")
             log_debug "Step 2: status=$status choice='$choice'"
 
             case $status in
-                0) cleanup ;; # Exit
+                0) STEP=1 ;; # Back
                 1) # Next
                     [[ "$choice" == " " ]] && continue
                     count=0
                     for f in "${!SELECTED_SSIDS[@]}"; do [[ "$f" != "ALL" && "${SELECTED_SSIDS[$f]}" == "on" ]] && ((count++)); done
-
+                    
                     if [[ $count -eq 0 && -n "$choice" && "$choice" != "ALL" ]]; then
                         SELECTED_SSIDS["$choice"]="on"
                         count=1
                         log_debug "Auto-selected focused SSID file: $choice"
                     fi
 
-                    if [[ $count -gt 0 ]]; then
+                    if [[ $count -gt 0 ]]; then 
                         STEP=3
                         log_debug "Proceeding to Step 3"
-                    else
+                    else 
                         dialog --msgbox "Please select at least one SSID file!" 5 40
                     fi
                     ;;
@@ -407,7 +470,7 @@ while true; do
             SFILES=${SFILES%, }
             SIFACES=""; for iface in "${INTERFACES[@]}"; do [[ "${SELECTED_INTERFACES[$iface]}" == "on" ]] && SIFACES+="$iface, "; done
             SIFACES=${SIFACES%, }
-
+            
             X_OFFSET=$(( (COLS - 70) / 2 )); [[ $X_OFFSET -lt 0 ]] && X_OFFSET=0
             Y_OFFSET=$(( (LINES - 12) / 2 )); [[ $Y_OFFSET -lt 0 ]] && Y_OFFSET=0
 
@@ -417,17 +480,16 @@ while true; do
                 --yesno "Ready to flood the air with fake APs\n\nUsing the following netcards: \Z3$SIFACES\Zn\n\nSSID files: \Z3$SFILES\Zn\n\nPress RUN to start. Press Ctrl+C later to stop." 12 70
             status=$?
             log_debug "Step 3: status=$status"
-            case $status in
-                0) STEP=2 ;;
-                1) break ;;
-                255) STEP=2 ;;
+            case $status in 
+                0) STEP=2 ;; 
+                1) break ;; 
+                255) STEP=2 ;; 
             esac ;;
     esac
 done
 
 # Execution
 clear
-echo "$BANNER"
 echo ""
 echo -e "\e[1;34m[+] Initializing Fake AP Flooding...\e[0m"
 log_debug "Initializing attack phase"
@@ -446,15 +508,13 @@ for iface in "${INTERFACES[@]}"; do
     if [[ "${SELECTED_INTERFACES[$iface]}" == "on" ]]; then
         TOUCHED_INTERFACES[$iface]="yes"
         nmcli device show "$iface" 2>/dev/null | grep -q "unmanaged" || (echo "[+] Setting $iface to unmanaged..."; nmcli device set "$iface" managed no >/dev/null 2>&1; IFACE_MANAGED_STATE[$iface]="managed")
-
+        
         echo "[+] Enabling monitor mode on $iface..."
         log_debug "Enabling monitor mode on $iface"
-
-        # Aggressive cleanup of existing monitor modes for this interface
+        
         if command -v timeout &>/dev/null; then
             timeout 8 airmon-ng stop "${iface}mon" >/dev/null 2>&1
             timeout 8 airmon-ng stop "${iface}min" >/dev/null 2>&1
-            # Also check if the base interface itself is in monitor mode
             if iw dev "$iface" info 2>/dev/null | grep -q "type monitor"; then
                 echo "[+] Resetting $iface from monitor mode..."
                 timeout 8 airmon-ng stop "$iface" >/dev/null 2>&1
@@ -467,19 +527,18 @@ for iface in "${INTERFACES[@]}"; do
                 airmon-ng stop "$iface" >/dev/null 2>&1
             fi
         fi
-
+        
         output=$(airmon-ng start "$iface" 2>/dev/null)
         mon_iface=$(echo "$output" | grep -oP 'monitor mode enabled on \K[^)]+' | tr -d '[]' | awk '{print $1}')
         [[ -z "$mon_iface" ]] && mon_iface=$(iw dev 2>/dev/null | awk '/Interface/ {iface=$2} /type monitor/ {print iface}' | grep -E "^${iface}" | head -n 1)
         [[ -z "$mon_iface" ]] && (ip link show "${iface}mon" >/dev/null 2>&1 && mon_iface="${iface}mon" || (ip link show "${iface}min" >/dev/null 2>&1 && mon_iface="${iface}min" || mon_iface="$iface"))
-
-        # Final fallback check: if iface is already in monitor mode, use it
+        
         if [[ -z "$mon_iface" ]]; then
             if iw dev "$iface" info 2>/dev/null | grep -q "type monitor"; then mon_iface="$iface"; fi
         fi
 
         log_debug "Resolved monitor interface for $iface: '$mon_iface'"
-
+        
         if [[ -z "$mon_iface" ]]; then
             msg="Could not determine monitor interface for $iface"
             echo -e "\e[1;31m[FAILED]\e[0m $msg"
@@ -490,19 +549,17 @@ for iface in "${INTERFACES[@]}"; do
         nmcli device set "$mon_iface" managed no >/dev/null 2>&1
         echo "[+] Starting mdk4 on $mon_iface..."
         log_debug "Executing: mdk4 \"$mon_iface\" b -h -c 1 -v \"$COMBINED_SSID_FILE\""
-
+        
         MDK_ERR_FILE=$(mktemp /tmp/mdk_err.XXXXXX)
         if [[ "$DEBUG" == "1" ]]; then
-            # Show on screen, log to error file, and append to debug log
             mdk4 "$mon_iface" b -h -c 1 -v "$COMBINED_SSID_FILE" > >(tee "$MDK_ERR_FILE" | tee -a "$DEBUG_LOG") 2>&1 &
         else
-            # Show on screen and log to error file
             mdk4 "$mon_iface" b -h -c 1 -v "$COMBINED_SSID_FILE" > >(tee "$MDK_ERR_FILE") 2>&1 &
         fi
         pid=$!
-
+        
         log_debug "Started mdk4 on $mon_iface (PID: $pid)"
-
+        
         sleep 1.5
         if kill -0 "$pid" 2>/dev/null; then
             echo -e "\e[1;32m[OK]\e[0m mdk4 started on $mon_iface"
